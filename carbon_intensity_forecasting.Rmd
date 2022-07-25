@@ -1,0 +1,128 @@
+---
+title: "timeseries_forecast"
+output: html_document
+date: '2022-07-22'
+---
+
+```{r}
+# load the packages
+library(tidyverse)
+library(tsibble)
+library(randomForest)
+library(forecast)
+library(corrplot)
+
+
+# file path
+file <- "~/Downloads/DK-DK2.csv"
+
+# read in the csv file
+denmark_tbl <- readr::read_delim(
+  file = file) %>% 
+
+  # remove rows with no carbon intensity observations
+  drop_na(carbon_intensity_avg) %>% 
+  
+  select(-c(timestamp, zone_name, production_sources)) 
+
+# find initial correlations between all features and average carbon intensity
+corr_carbon <- cor(denmark_tbl %>% select(-datetime))
+
+# select variables that are most important to initially train random forest 
+most_impt <- names(corr_carbon[which(abs(corr_carbon[,1]) > .8), ][,1])
+
+# drop initial variables that don't have atleast 80% observations in time period
+denmark_tbl <- na.omit(denmark_tbl[,(colMeans(is.na(denmark_tbl))) < .2])  %>%
+  as_tsibble(index = "datetime") %>% 
+  select(most_impt) 
+
+# convert to timeseries format
+denmark_ts <- as.ts(denmark_tbl %>% select(most_impt))
+```
+
+
+# Visualize time series
+```{r}
+plot_org <- denmark_tbl %>% 
+  ggplot(aes(datetime, carbon_intensity_avg)) + 
+  geom_line() +
+  theme_minimal() +
+  labs(title = "Carbon Intensity 2014 - 2019", x = "Year", y = "Intensity")
+
+plot_org
+```
+
+
+# Time Delay Embedding for RF predictions
+```{r}
+lag_order <- 48   # the desired number of lags (48 hours)
+horizon <- 24  # the forecast (24 hours)
+
+denmark_ts_mbd <- embed(denmark_ts, lag_order + 1) 
+denmark_ts_mbd <- na.omit(denmark_ts_mbd)
+```
+
+# Modeling
+```{r}
+y_train <- denmark_ts_mbd[, 1] # the target (carbon intensity average at hourly level)
+X_train <- denmark_ts_mbd[, -1] # everything but the target (previous data included)
+
+y_test <- window(denmark_ts, start = c(2017,1), end = c(2017, 24)) # test on random day 
+X_test <- denmark_ts_mbd[nrow(denmark_ts_mbd), c(1:lag_order)] # the test set consisting of one day 
+```
+
+
+# Forecasting
+```{r}
+forecasts_rf <- numeric(horizon)
+
+for (i in 1:horizon){
+  # set seed
+  set.seed(42)
+
+  # fit the model
+  fit_rf <- randomForest(X_train, y_train)
+
+  # predict using the test set
+  forecasts_rf[i] <- predict(fit_rf, X_test)
+
+  # recursively reshape training data to reflect the time distance corresponding to the current forecast horizon.
+  y_train <- y_train[-1] 
+
+  X_train <- X_train[-nrow(X_train), ] 
+}
+```
+
+
+# Predict on time scale
+```{r}
+# convert to ts format
+y_pred <- ts(
+  forecasts_rf,
+  start = c(2019, 1),
+  frequency = 24
+)
+
+# add the forecasts to the original tibble
+denmark_tbl <- denmark_tbl %>% 
+  mutate(Forecast = c(rep(NA, length(denmark_ts_org)), y_pred))
+
+# visualize the forecasts
+plot_fc <- denmark_tbl %>% 
+  ggplot(aes(x = datetime)) +
+  geom_line(aes(y = carbon_intensity_avg )) +
+  geom_line(aes(y = Forecast ), color = "blue") +
+  theme_minimal() +
+  labs(
+    title = "Forecast of Carbon Intensity for 2019",
+    x = "Year",
+    y = "Intensity"
+  )
+
+# compute model accuracy
+accuracy(y_pred, y_test)
+```
+
+# Predicting forecast of carbon intensity of Denmark for next 24 hours
+This model (fit_rf) could then be run on a given hour with the necessary feature data to forecast carbon intensity for Denmark.  
+Other thoughts that I would do if I spent more time on the problem would be differencing and transforming the data to remove any autocorrelation effects and normalize the data. Additionally, running a principal components analysis of the features before training the model would decrease model fit time and reduce multicolinearity but increase overhead time in executing the predictions since PCA would need to be run before predictions are made. This time v. accuracy analysis is something I would explore in further iteratoins. 
